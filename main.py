@@ -21,6 +21,7 @@ PAIRS = [
 ]
 
 CHECK_INTERVAL = 300  # 5 мүнөт
+MIN_CONFIRM = 5  # 5/5 индикатор дал келсе гана сигнал
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -44,9 +45,7 @@ def get_price_data(from_cur, to_cur):
             log.warning("API жооп бербеди: " + str(data))
             return None
         time_series = data["Time Series FX (5min)"]
-        closes = []
-        highs = []
-        lows = []
+        closes, highs, lows = [], [], []
         for key in sorted(time_series.keys(), reverse=True)[:50]:
             closes.append(float(time_series[key]["4. close"]))
             highs.append(float(time_series[key]["2. high"]))
@@ -113,12 +112,9 @@ def calculate_stochastic(closes, highs, lows, period=14):
     k = ((closes[-1] - low_min) / (high_max - low_min)) * 100
     return round(k, 2)
 
-# ==================== TP/SL ЭСЕПТӨӨ ====================
+# ==================== TP/SL ====================
 def calculate_tp_sl(price, direction, from_cur, to_cur):
-    if to_cur == "JPY" or from_cur == "JPY":
-        pip = 0.01
-    else:
-        pip = 0.0001
+    pip = 0.01 if "JPY" in (from_cur, to_cur) else 0.0001
     tp_pips = 40
     sl_pips = 20
     if direction == "BUY":
@@ -129,7 +125,7 @@ def calculate_tp_sl(price, direction, from_cur, to_cur):
         sl = round(price + (sl_pips * pip), 5)
     return tp, sl
 
-# ==================== СИГНАЛ ====================
+# ==================== СИГНАЛ АНАЛИЗИ ====================
 def analyze_pair(from_cur, to_cur):
     pair = from_cur + "/" + to_cur
     result = get_price_data(from_cur, to_cur)
@@ -142,7 +138,6 @@ def analyze_pair(from_cur, to_cur):
 
     current_price = closes[-1]
 
-    # Индикаторлор
     rsi = calculate_rsi(closes)
     ma10 = calculate_ma(closes, 10)
     ma20 = calculate_ma(closes, 20)
@@ -150,55 +145,47 @@ def analyze_pair(from_cur, to_cur):
     bb_mid, bb_upper, bb_lower = calculate_bollinger(closes)
     stoch = calculate_stochastic(closes, highs, lows)
 
-    signals = []
+    # Ар бир индикатор текшерүү
+    checks = {
+        "RSI":        None,
+        "MA":         None,
+        "MACD":       None,
+        "Bollinger":  None,
+        "Stochastic": None,
+    }
 
-    # RSI
-    if rsi:
-        if rsi < 30: signals.append("BUY")
-        elif rsi > 70: signals.append("SELL")
+    if rsi is not None:
+        if rsi < 30:   checks["RSI"] = "BUY"
+        elif rsi > 70: checks["RSI"] = "SELL"
 
-    # MA кесилишүү
     if ma10 and ma20:
-        if ma10 > ma20: signals.append("BUY")
-        elif ma10 < ma20: signals.append("SELL")
+        if ma10 > ma20:   checks["MA"] = "BUY"
+        elif ma10 < ma20: checks["MA"] = "SELL"
 
-    # MACD
     if macd and macd_signal:
-        if macd > macd_signal: signals.append("BUY")
-        elif macd < macd_signal: signals.append("SELL")
+        if macd > macd_signal:   checks["MACD"] = "BUY"
+        elif macd < macd_signal: checks["MACD"] = "SELL"
 
-    # Bollinger Bands
     if bb_upper and bb_lower:
-        if current_price < bb_lower: signals.append("BUY")
-        elif current_price > bb_upper: signals.append("SELL")
+        if current_price < bb_lower:   checks["Bollinger"] = "BUY"
+        elif current_price > bb_upper: checks["Bollinger"] = "SELL"
 
-    # Stochastic
-    if stoch:
-        if stoch < 20: signals.append("BUY")
-        elif stoch > 80: signals.append("SELL")
+    if stoch is not None:
+        if stoch < 20:   checks["Stochastic"] = "BUY"
+        elif stoch > 80: checks["Stochastic"] = "SELL"
 
-    buy_count = signals.count("BUY")
-    sell_count = signals.count("SELL")
+    # 5/5 тастыктоо
+    buy_count  = sum(1 for v in checks.values() if v == "BUY")
+    sell_count = sum(1 for v in checks.values() if v == "SELL")
 
-    # 3төн ашык дал келсе сигнал
-    if buy_count >= 3:
+    log.info(pair + " — BUY:" + str(buy_count) + " SELL:" + str(sell_count))
+
+    if buy_count == MIN_CONFIRM:
         direction = "BUY"
-        if buy_count == 5:
-            strength = "🔥 Өтө Күчтүү"
-        elif buy_count == 4:
-            strength = "💪 Күчтүү"
-        else:
-            strength = "👍 Орточо"
-    elif sell_count >= 3:
+    elif sell_count == MIN_CONFIRM:
         direction = "SELL"
-        if sell_count == 5:
-            strength = "🔥 Өтө Күчтүү"
-        elif sell_count == 4:
-            strength = "💪 Күчтүү"
-        else:
-            strength = "👍 Орточо"
     else:
-        return None
+        return None  # 5/5 эмес — сигнал жок
 
     tp, sl = calculate_tp_sl(current_price, direction, from_cur, to_cur)
 
@@ -206,7 +193,6 @@ def analyze_pair(from_cur, to_cur):
         "pair": pair,
         "price": current_price,
         "direction": direction,
-        "strength": strength,
         "tp": tp,
         "sl": sl,
         "rsi": rsi,
@@ -214,22 +200,28 @@ def analyze_pair(from_cur, to_cur):
         "macd": macd,
         "bb_upper": bb_upper,
         "bb_lower": bb_lower,
-        "buy": buy_count,
-        "sell": sell_count,
+        "checks": checks,
         "time": datetime.now().strftime("%H:%M:%S")
     }
 
 # ==================== ЖӨНӨТҮҮ ====================
 def send_signal(s):
-    if s["direction"] == "BUY":
-        emoji = "🟢"
-        action = "BUY — Сатып АЛ"
-    else:
-        emoji = "🔴"
-        action = "SELL — Сат"
+    emoji = "🟢" if s["direction"] == "BUY" else "🔴"
+    action = "BUY — Сатып АЛ" if s["direction"] == "BUY" else "SELL — Сат"
 
-    total = s["buy"] + s["sell"]
-    confirmed = s["buy"] if s["direction"] == "BUY" else s["sell"]
+    # Ар бир индикатордун жыйынтыгы
+    ind_lines = ""
+    icons = {"BUY": "✅", "SELL": "✅", None: "⬜"}
+    names = {
+        "RSI": "RSI:         `" + str(s["rsi"]) + "`",
+        "MA": "MA(10/20)",
+        "MACD": "MACD:        `" + str(s["macd"]) + "`",
+        "Bollinger": "Bollinger BB",
+        "Stochastic": "Stochastic:  `" + str(s["stoch"]) + "`",
+    }
+    for k, v in s["checks"].items():
+        mark = "✅" if v == s["direction"] else "❌"
+        ind_lines += mark + " " + names[k] + "\n"
 
     msg = (
         emoji + " *" + action + "* " + emoji + "\n"
@@ -239,14 +231,9 @@ def send_signal(s):
         "🎯 Take Profit:  `" + str(s["tp"]) + "`\n"
         "🛑 Stop Loss:    `" + str(s["sl"]) + "`\n"
         "━━━━━━━━━━━━━━━\n"
-        "⚡ Күч: " + s["strength"] + "\n"
-        "✅ Тастыктоо: " + str(confirmed) + "/5 индикатор\n"
+        "🔥 *5/5 ИНДИКАТОР ТАСТЫКТАДЫ!*\n"
         "━━━━━━━━━━━━━━━\n"
-        "📊 RSI: `" + str(s["rsi"]) + "`\n"
-        "📉 Stochastic: `" + str(s["stoch"]) + "`\n"
-        "📈 MACD: `" + str(s["macd"]) + "`\n"
-        "🎯 BB Жогору: `" + str(s["bb_upper"]) + "`\n"
-        "🎯 BB Төмөн: `" + str(s["bb_lower"]) + "`\n"
+        + ind_lines +
         "━━━━━━━━━━━━━━━\n"
         "🌐 Alpha Vantage чыныгы баа\n"
         "⏰ " + s["time"] + "\n"
@@ -260,7 +247,7 @@ def send_signal(s):
 # ==================== АВТО СКАНЕР ====================
 def auto_scanner():
     while True:
-        log.info("Сканерлөө...")
+        log.info("Сканерлөө башталды...")
         for from_cur, to_cur in PAIRS:
             try:
                 signal = analyze_pair(from_cur, to_cur)
@@ -276,9 +263,12 @@ def auto_scanner():
 def start(message):
     bot.send_message(message.chat.id,
         "📊 *Forex Сигнал Боту* 🚀\n\n"
-        "✅ 5 индикатор: RSI, MACD, MA, Bollinger, Stochastic\n"
-        "✅ 7 валюта жубу\n"
-        "✅ Alpha Vantage чыныгы баалар\n\n"
+        "🔥 Сигнал БЕРИ 5/5 индикатор тастыктаганда!\n\n"
+        "✅ RSI\n"
+        "✅ MA (10/20)\n"
+        "✅ MACD\n"
+        "✅ Bollinger Bands\n"
+        "✅ Stochastic\n\n"
         "/scan — азыр сканерлөө\n"
         "/status — бот абалы\n"
         "/pairs — жуптар тизмеси",
@@ -298,14 +288,14 @@ def manual_scan(message):
     if found:
         bot.send_message(message.chat.id, "✅ " + str(found) + " сигнал табылды!")
     else:
-        bot.send_message(message.chat.id, "❌ Азыр так сигнал жок")
+        bot.send_message(message.chat.id, "❌ Азыр 5/5 тастыкталган сигнал жок")
 
 @bot.message_handler(commands=["status"])
 def status(message):
     bot.send_message(message.chat.id,
         "✅ Бот иштеп жатат\n"
+        "🔥 Шарт: 5/5 индикатор дал келсе гана сигнал\n"
         "🌐 API: Alpha Vantage\n"
-        "📊 Индикаторлор: RSI, MACD, MA, Bollinger, Stochastic\n"
         "⏱ " + str(CHECK_INTERVAL//60) + " мүнөт сайын текшерет\n"
         "💱 Жуптар: " + str(len(PAIRS))
     )
@@ -317,7 +307,7 @@ def pairs_list(message):
 
 # ==================== ИШТЕТҮҮ ====================
 if __name__ == "__main__":
-    log.info("Forex Сигнал Боту башталды...")
+    log.info("Forex Сигнал Боту башталды — 5/5 режими!")
     threading.Thread(target=auto_scanner, daemon=True).start()
     while True:
         try:
