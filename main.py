@@ -5,6 +5,7 @@ import threading
 import logging
 from datetime import datetime
 
+# ==================== НАСТРОЙКА ====================
 BOT_TOKEN = "8559551745:AAFCue6bmPgvpkUdhQ_aSjR7krguHft_ACI"
 ADMIN_ID = 8693522887
 API_KEY = "NEUGRBMAZ9YL1O2S"
@@ -15,14 +16,17 @@ PAIRS = [
     ("USD", "JPY"),
     ("USD", "CHF"),
     ("AUD", "USD"),
+    ("USD", "CAD"),
+    ("NZD", "USD"),
 ]
 
-CHECK_INTERVAL = 300
+CHECK_INTERVAL = 300  # 5 мүнөт
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# ==================== БААСЫН АЛУу ====================
 def get_price_data(from_cur, to_cur):
     try:
         url = (
@@ -37,16 +41,22 @@ def get_price_data(from_cur, to_cur):
         response = requests.get(url, timeout=15)
         data = response.json()
         if "Time Series FX (5min)" not in data:
+            log.warning("API жооп бербеди: " + str(data))
             return None
         time_series = data["Time Series FX (5min)"]
         closes = []
+        highs = []
+        lows = []
         for key in sorted(time_series.keys(), reverse=True)[:50]:
             closes.append(float(time_series[key]["4. close"]))
-        return list(reversed(closes))
+            highs.append(float(time_series[key]["2. high"]))
+            lows.append(float(time_series[key]["3. low"]))
+        return list(reversed(closes)), list(reversed(highs)), list(reversed(lows))
     except Exception as e:
         log.error("Баа алууда ката: " + str(e))
         return None
 
+# ==================== ИНДИКАТОРЛОР ====================
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
@@ -83,13 +93,34 @@ def calculate_macd(prices, fast=12, slow=26):
     signal_line = round(macd_line * 0.9, 6)
     return macd_line, signal_line
 
+def calculate_bollinger(prices, period=20):
+    if len(prices) < period:
+        return None, None, None
+    ma = sum(prices[-period:]) / period
+    variance = sum((p - ma) ** 2 for p in prices[-period:]) / period
+    std = variance ** 0.5
+    upper = round(ma + 2 * std, 5)
+    lower = round(ma - 2 * std, 5)
+    return round(ma, 5), upper, lower
+
+def calculate_stochastic(closes, highs, lows, period=14):
+    if len(closes) < period:
+        return None
+    high_max = max(highs[-period:])
+    low_min = min(lows[-period:])
+    if high_max == low_min:
+        return 50
+    k = ((closes[-1] - low_min) / (high_max - low_min)) * 100
+    return round(k, 2)
+
+# ==================== TP/SL ЭСЕПТӨӨ ====================
 def calculate_tp_sl(price, direction, from_cur, to_cur):
     if to_cur == "JPY" or from_cur == "JPY":
         pip = 0.01
     else:
         pip = 0.0001
-    tp_pips = 30
-    sl_pips = 15
+    tp_pips = 40
+    sl_pips = 20
     if direction == "BUY":
         tp = round(price + (tp_pips * pip), 5)
         sl = round(price - (sl_pips * pip), 5)
@@ -98,47 +129,79 @@ def calculate_tp_sl(price, direction, from_cur, to_cur):
         sl = round(price + (sl_pips * pip), 5)
     return tp, sl
 
-def is_market_open():
-    now = datetime.utcnow()
-    if now.weekday() == 6:
-        return False
-    if now.weekday() == 5 and now.hour >= 21:
-        return False
-    if now.weekday() == 0 and now.hour < 22:
-        return False
-    return True
-
+# ==================== СИГНАЛ ====================
 def analyze_pair(from_cur, to_cur):
     pair = from_cur + "/" + to_cur
-    prices = get_price_data(from_cur, to_cur)
-    if not prices or len(prices) < 20:
+    result = get_price_data(from_cur, to_cur)
+    if not result:
         return None
-    current_price = prices[-1]
-    rsi = calculate_rsi(prices)
-    ma20 = calculate_ma(prices, 20)
-    ma10 = calculate_ma(prices, 10)
-    macd, macd_signal = calculate_macd(prices)
+
+    closes, highs, lows = result
+    if len(closes) < 26:
+        return None
+
+    current_price = closes[-1]
+
+    # Индикаторлор
+    rsi = calculate_rsi(closes)
+    ma10 = calculate_ma(closes, 10)
+    ma20 = calculate_ma(closes, 20)
+    macd, macd_signal = calculate_macd(closes)
+    bb_mid, bb_upper, bb_lower = calculate_bollinger(closes)
+    stoch = calculate_stochastic(closes, highs, lows)
+
     signals = []
+
+    # RSI
     if rsi:
-        if rsi < 35: signals.append("BUY")
-        elif rsi > 65: signals.append("SELL")
-    if ma20 and ma10:
-        if current_price > ma10 > ma20: signals.append("BUY")
-        elif current_price < ma10 < ma20: signals.append("SELL")
+        if rsi < 30: signals.append("BUY")
+        elif rsi > 70: signals.append("SELL")
+
+    # MA кесилишүү
+    if ma10 and ma20:
+        if ma10 > ma20: signals.append("BUY")
+        elif ma10 < ma20: signals.append("SELL")
+
+    # MACD
     if macd and macd_signal:
         if macd > macd_signal: signals.append("BUY")
         elif macd < macd_signal: signals.append("SELL")
+
+    # Bollinger Bands
+    if bb_upper and bb_lower:
+        if current_price < bb_lower: signals.append("BUY")
+        elif current_price > bb_upper: signals.append("SELL")
+
+    # Stochastic
+    if stoch:
+        if stoch < 20: signals.append("BUY")
+        elif stoch > 80: signals.append("SELL")
+
     buy_count = signals.count("BUY")
     sell_count = signals.count("SELL")
-    if buy_count >= 2:
+
+    # 3төн ашык дал келсе сигнал
+    if buy_count >= 3:
         direction = "BUY"
-        strength = "Күчтүү" if buy_count == 3 else "Орточо"
-    elif sell_count >= 2:
+        if buy_count == 5:
+            strength = "🔥 Өтө Күчтүү"
+        elif buy_count == 4:
+            strength = "💪 Күчтүү"
+        else:
+            strength = "👍 Орточо"
+    elif sell_count >= 3:
         direction = "SELL"
-        strength = "Күчтүү" if sell_count == 3 else "Орточо"
+        if sell_count == 5:
+            strength = "🔥 Өтө Күчтүү"
+        elif sell_count == 4:
+            strength = "💪 Күчтүү"
+        else:
+            strength = "👍 Орточо"
     else:
         return None
+
     tp, sl = calculate_tp_sl(current_price, direction, from_cur, to_cur)
+
     return {
         "pair": pair,
         "price": current_price,
@@ -147,13 +210,16 @@ def analyze_pair(from_cur, to_cur):
         "tp": tp,
         "sl": sl,
         "rsi": rsi,
-        "ma10": ma10,
+        "stoch": stoch,
         "macd": macd,
+        "bb_upper": bb_upper,
+        "bb_lower": bb_lower,
         "buy": buy_count,
         "sell": sell_count,
         "time": datetime.now().strftime("%H:%M:%S")
     }
 
+# ==================== ЖӨНӨТҮҮ ====================
 def send_signal(s):
     if s["direction"] == "BUY":
         emoji = "🟢"
@@ -161,6 +227,10 @@ def send_signal(s):
     else:
         emoji = "🔴"
         action = "SELL — Сат"
+
+    total = s["buy"] + s["sell"]
+    confirmed = s["buy"] if s["direction"] == "BUY" else s["sell"]
+
     msg = (
         emoji + " *" + action + "* " + emoji + "\n"
         "━━━━━━━━━━━━━━━\n"
@@ -169,12 +239,16 @@ def send_signal(s):
         "🎯 Take Profit:  `" + str(s["tp"]) + "`\n"
         "🛑 Stop Loss:    `" + str(s["sl"]) + "`\n"
         "━━━━━━━━━━━━━━━\n"
-        "💪 Күч: " + s["strength"] + "\n"
-        "📊 RSI: `" + str(s["rsi"]) + "`\n"
-        "📈 MA10: `" + str(s["ma10"]) + "`\n"
-        "📉 MACD: `" + str(s["macd"]) + "`\n"
+        "⚡ Күч: " + s["strength"] + "\n"
+        "✅ Тастыктоо: " + str(confirmed) + "/5 индикатор\n"
         "━━━━━━━━━━━━━━━\n"
-        "✅ Alpha Vantage чыныгы баа\n"
+        "📊 RSI: `" + str(s["rsi"]) + "`\n"
+        "📉 Stochastic: `" + str(s["stoch"]) + "`\n"
+        "📈 MACD: `" + str(s["macd"]) + "`\n"
+        "🎯 BB Жогору: `" + str(s["bb_upper"]) + "`\n"
+        "🎯 BB Төмөн: `" + str(s["bb_lower"]) + "`\n"
+        "━━━━━━━━━━━━━━━\n"
+        "🌐 Alpha Vantage чыныгы баа\n"
         "⏰ " + s["time"] + "\n"
         "⚠️ _Соода тобокелчилиги өз мойнуңузда!_"
     )
@@ -183,12 +257,9 @@ def send_signal(s):
     except Exception as e:
         log.error("Жөнөтүүдө ката: " + str(e))
 
+# ==================== АВТО СКАНЕР ====================
 def auto_scanner():
     while True:
-        if not is_market_open():
-            log.info("Базар жабык. 30 мүнөттөн кийин текшерет...")
-            time.sleep(1800)
-            continue
         log.info("Сканерлөө...")
         for from_cur, to_cur in PAIRS:
             try:
@@ -200,11 +271,14 @@ def auto_scanner():
                 log.error(str(e))
         time.sleep(CHECK_INTERVAL)
 
+# ==================== БОТ КОМАНДЫ ====================
 @bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(message.chat.id,
-        "📊 *Forex Сигнал Боту*\n\n"
-        "✅ Alpha Vantage чыныгы баалар!\n\n"
+        "📊 *Forex Сигнал Боту* 🚀\n\n"
+        "✅ 5 индикатор: RSI, MACD, MA, Bollinger, Stochastic\n"
+        "✅ 7 валюта жубу\n"
+        "✅ Alpha Vantage чыныгы баалар\n\n"
         "/scan — азыр сканерлөө\n"
         "/status — бот абалы\n"
         "/pairs — жуптар тизмеси",
@@ -213,10 +287,7 @@ def start(message):
 
 @bot.message_handler(commands=["scan"])
 def manual_scan(message):
-    if not is_market_open():
-        bot.send_message(message.chat.id, "⛔ Базар азыр жабык! Дүйшөмбүдө ачылат.")
-        return
-    bot.send_message(message.chat.id, "🔍 Сканерлөө башталды... (бир аз күт)")
+    bot.send_message(message.chat.id, "🔍 Сканерлөө башталды... (1-2 мүнөт күт)")
     found = 0
     for from_cur, to_cur in PAIRS:
         signal = analyze_pair(from_cur, to_cur)
@@ -231,11 +302,10 @@ def manual_scan(message):
 
 @bot.message_handler(commands=["status"])
 def status(message):
-    market_status = "🟢 Ачык" if is_market_open() else "🔴 Жабык"
     bot.send_message(message.chat.id,
         "✅ Бот иштеп жатат\n"
         "🌐 API: Alpha Vantage\n"
-        "📊 Базар: " + market_status + "\n"
+        "📊 Индикаторлор: RSI, MACD, MA, Bollinger, Stochastic\n"
         "⏱ " + str(CHECK_INTERVAL//60) + " мүнөт сайын текшерет\n"
         "💱 Жуптар: " + str(len(PAIRS))
     )
@@ -245,6 +315,7 @@ def pairs_list(message):
     text = "💱 *Жуптар:*\n" + "\n".join("• " + f + "/" + t for f, t in PAIRS)
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
+# ==================== ИШТЕТҮҮ ====================
 if __name__ == "__main__":
     log.info("Forex Сигнал Боту башталды...")
     threading.Thread(target=auto_scanner, daemon=True).start()
