@@ -306,11 +306,11 @@ def pairs_list(message):
 
 # ==================== ИШТЕТҮҮ ====================
 if __name__ == "__main__":
-    log.info("Forex Сигнал Боту башталды — 5/5 режими!")
+    log.info("Forex Сигнал Боту башталды!")
     threading.Thread(target=auto_scanner, daemon=True).start()
     while True:
         try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+            bot.polling(none_stop=True, timeout=60)
         except Exception as e:
             log.error("Ката: " + str(e))
             time.sleep(5)
