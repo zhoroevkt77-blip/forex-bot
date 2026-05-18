@@ -4,9 +4,9 @@ import time
 import threading
 import logging
 from datetime import datetime
-
+import os
 # ==================== НАСТРОЙКА ====================
-BOT_TOKEN = "8559551745:AAGtdcAN7bFamy0PRGz8L3YhTagJwNFoYrM"
+BOT_TOKEN = os.environ.get('8559551745:AAG6Oyoqp6adwd-6kLbrhAdblYOcRTjPGC0')
 ADMIN_ID = 8693522887
 API_KEY = "NEUGRBMAZ9YL1O2S"
 
