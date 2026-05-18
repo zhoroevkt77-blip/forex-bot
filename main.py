@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 
 # ==================== НАСТРОЙКА ====================
-BOT_TOKEN = "8559551745:AAFCue6bmPgvpkUdhQ_aSjR7krguHft_ACI"
+BOT_TOKEN = "8559551745:AAGtdcAN7bFamy0PRGz8L3YhTagJwNFoYrM"
 ADMIN_ID = 8693522887
 API_KEY = "NEUGRBMAZ9YL1O2S"
 
