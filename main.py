@@ -315,3 +315,5 @@ if __name__ == "__main__":
         except Exception as e:
             log.error("Ката: " + str(e))
             time.sleep(5)
+            cd ~
+            git pull
