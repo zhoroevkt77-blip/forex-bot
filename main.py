@@ -20,7 +20,7 @@ PAIRS = [
 ]
 
 CHECK_INTERVAL = 300  # 5 мүнөт
-MIN_CONFIRM = 3  # 3/5 индикатор дал келсе гана сигнал
+MIN_CONFIRM >= 3  # 3/5 индикатор дал келсе гана сигнал
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
