@@ -1,4 +1,4 @@
-8 telebot
+import telebot
 import requests
 import time
 import threading
