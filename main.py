@@ -8,56 +8,57 @@ from datetime import datetime
 # ==================== НАСТРОЙКА ====================
 BOT_TOKEN = "8559551745:AAGp25BeOmXva9PoQ7FVW9JoKcQymd-cZ7E"
 ADMIN_ID = 8693522887
-API_KEY = "NEUGRBMAZ9YL1O2S"
+TWELVE_API_KEY = "8bb0a93e7742495da70ccbd53f2bbb7c"
 
 PAIRS = [
-    ("EUR", "USD"),
-    ("GBP", "USD"),
-    ("USD", "JPY"),
-    ("USD", "CHF"),
-    ("AUD", "USD"),
-    ("USD", "CAD"),
-    ("NZD", "USD"),
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "AUD/USD",
+    "USD/CAD",
+    "NZD/USD",
 ]
 
 CHECK_INTERVAL = 300
-MIN_CONFIRM = 6      # 6/11 индикатор
+MIN_CONFIRM = 6
 TOTAL_INDICATORS = 11
-TIMEFRAME = "15min"  # 15 мүнөт
+TIMEFRAME = "15min"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ==================== БААСЫН АЛУу ====================
-def get_price_data(from_cur, to_cur):
+def get_price_data(pair):
     try:
         url = (
-            "https://www.alphavantage.co/query"
-            "?function=FX_INTRADAY"
-            "&from_symbol=" + from_cur +
-            "&to_symbol=" + to_cur +
+            "https://api.twelvedata.com/time_series"
+            "?symbol=" + pair +
             "&interval=" + TIMEFRAME +
-            "&apikey=" + API_KEY +
-            "&outputsize=compact"
+            "&outputsize=220" +
+            "&apikey=" + TWELVE_API_KEY
         )
         response = requests.get(url, timeout=15)
         data = response.json()
-        key = "Time Series FX (" + TIMEFRAME + ")"
-        if key not in data:
-            log.warning("API жооп бербеди: " + str(data))
+
+        if "values" not in data:
+            log.warning(pair + " API жооп бербеди: " + str(data))
             return None
-        time_series = data[key]
-        closes, highs, lows, volumes = [], [], [], []
-        for k in sorted(time_series.keys(), reverse=True)[:100]:
-            closes.append(float(time_series[k]["4. close"]))
-            highs.append(float(time_series[k]["2. high"]))
-            lows.append(float(time_series[k]["3. low"]))
-        return (
-            list(reversed(closes)),
-            list(reversed(highs)),
-            list(reversed(lows)),
-        )
+
+        values = data["values"]
+        closes, highs, lows = [], [], []
+        for v in reversed(values):
+            closes.append(float(v["close"]))
+            highs.append(float(v["high"]))
+            lows.append(float(v["low"]))
+
+        if len(closes) < 50:
+            log.warning(pair + " — маалымат жетишсиз")
+            return None
+
+        return closes, highs, lows
+
     except Exception as e:
         log.error("Баа алууда ката: " + str(e))
         return None
@@ -88,21 +89,32 @@ def calculate_ema(prices, period):
     if len(prices) < period:
         return None
     k = 2 / (period + 1)
-    val = prices[0]
-    for p in prices[1:]:
+    val = sum(prices[:period]) / period
+    for p in prices[period:]:
         val = p * k + val * (1 - k)
     return round(val, 5)
 
-def calculate_macd(prices, fast=12, slow=26):
-    if len(prices) < slow:
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    if len(prices) < slow + signal:
         return None, None
-    ema_fast = calculate_ema(prices[-fast*2:], fast)
-    ema_slow = calculate_ema(prices[-slow*2:], slow)
+    ema_fast = calculate_ema(prices, fast)
+    ema_slow = calculate_ema(prices, slow)
     if ema_fast is None or ema_slow is None:
         return None, None
-    macd_line = round(ema_fast - ema_slow, 6)
-    signal_line = round(macd_line * 0.9, 6)
-    return macd_line, signal_line
+    # MACD тарыхын эсептөө
+    macd_history = []
+    for i in range(slow, len(prices)):
+        ef = calculate_ema(prices[:i+1], fast)
+        es = calculate_ema(prices[:i+1], slow)
+        if ef and es:
+            macd_history.append(ef - es)
+    if len(macd_history) < signal:
+        return None, None
+    macd_line = macd_history[-1]
+    signal_line = calculate_ema(macd_history, signal)
+    if signal_line is None:
+        return None, None
+    return round(macd_line, 6), round(signal_line, 6)
 
 def calculate_bollinger(prices, period=20):
     if len(prices) < period:
@@ -167,8 +179,8 @@ def calculate_ema_cross(prices):
     return ema50, ema200
 
 # ==================== TP/SL ====================
-def calculate_tp_sl(price, direction, from_cur, to_cur, atr=None):
-    pip = 0.01 if "JPY" in (from_cur, to_cur) else 0.0001
+def calculate_tp_sl(price, direction, pair, atr=None):
+    pip = 0.01 if "JPY" in pair else 0.0001
     if atr:
         tp_dist = atr * 2
         sl_dist = atr * 1
@@ -184,31 +196,25 @@ def calculate_tp_sl(price, direction, from_cur, to_cur, atr=None):
     return tp, sl
 
 # ==================== СИГНАЛ АНАЛИЗИ ====================
-def analyze_pair(from_cur, to_cur):
-    pair = from_cur + "/" + to_cur
-    result = get_price_data(from_cur, to_cur)
+def analyze_pair(pair):
+    result = get_price_data(pair)
     if not result:
         return None
 
     closes, highs, lows = result
-    if len(closes) < 200:
-        log.warning(pair + " — жетиштүү маалымат жок")
-        return None
-
     current_price = closes[-1]
 
-    # Индикаторлорду эсептөө
-    rsi        = calculate_rsi(closes)
-    ma10       = calculate_ma(closes, 10)
-    ma20       = calculate_ma(closes, 20)
-    macd, macd_signal = calculate_macd(closes)
+    rsi             = calculate_rsi(closes)
+    ma10            = calculate_ma(closes, 10)
+    ma20            = calculate_ma(closes, 20)
+    macd, macd_sig  = calculate_macd(closes)
     bb_mid, bb_upper, bb_lower = calculate_bollinger(closes)
-    stoch      = calculate_stochastic(closes, highs, lows)
-    atr        = calculate_atr(highs, lows, closes)
-    cci        = calculate_cci(highs, lows, closes)
-    williams   = calculate_williams_r(highs, lows, closes)
-    momentum   = calculate_momentum(closes)
-    ema50, ema200 = calculate_ema_cross(closes)
+    stoch           = calculate_stochastic(closes, highs, lows)
+    atr             = calculate_atr(highs, lows, closes)
+    cci             = calculate_cci(highs, lows, closes)
+    williams        = calculate_williams_r(highs, lows, closes)
+    momentum        = calculate_momentum(closes)
+    ema50, ema200   = calculate_ema_cross(closes)
 
     checks = {
         "RSI":        None,
@@ -224,58 +230,46 @@ def analyze_pair(from_cur, to_cur):
         "EMA Trend":  None,
     }
 
-    # 1. RSI
     if rsi is not None:
         if rsi < 35:   checks["RSI"] = "BUY"
         elif rsi > 65: checks["RSI"] = "SELL"
 
-    # 2. MA
     if ma10 and ma20:
         if ma10 > ma20:   checks["MA"] = "BUY"
         elif ma10 < ma20: checks["MA"] = "SELL"
 
-    # 3. MACD
-    if macd and macd_signal:
-        if macd > macd_signal:   checks["MACD"] = "BUY"
-        elif macd < macd_signal: checks["MACD"] = "SELL"
+    if macd is not None and macd_sig is not None:
+        if macd > macd_sig:   checks["MACD"] = "BUY"
+        elif macd < macd_sig: checks["MACD"] = "SELL"
 
-    # 4. Bollinger
     if bb_upper and bb_lower:
         if current_price < bb_lower:   checks["Bollinger"] = "BUY"
         elif current_price > bb_upper: checks["Bollinger"] = "SELL"
 
-    # 5. Stochastic
     if stoch is not None:
         if stoch < 25:   checks["Stochastic"] = "BUY"
         elif stoch > 75: checks["Stochastic"] = "SELL"
 
-    # 6. ATR (волатилдүүлүк тренди)
     if atr is not None:
-        atr_ma = calculate_ma([atr] * 14, 14)
-        if current_price > closes[-2]:  checks["ATR"] = "BUY"
-        else:                           checks["ATR"] = "SELL"
+        if current_price > closes[-2]: checks["ATR"] = "BUY"
+        else:                          checks["ATR"] = "SELL"
 
-    # 7. CCI
     if cci is not None:
         if cci < -100:  checks["CCI"] = "BUY"
         elif cci > 100: checks["CCI"] = "SELL"
 
-    # 8. Williams %R
     if williams is not None:
-        if williams < -80:  checks["Williams%R"] = "BUY"
+        if williams < -80:   checks["Williams%R"] = "BUY"
         elif williams > -20: checks["Williams%R"] = "SELL"
 
-    # 9. Momentum
     if momentum is not None:
         if momentum > 0:   checks["Momentum"] = "BUY"
         elif momentum < 0: checks["Momentum"] = "SELL"
 
-    # 10. EMA Cross (50/200)
     if ema50 and ema200:
         if ema50 > ema200:   checks["EMA Cross"] = "BUY"
         elif ema50 < ema200: checks["EMA Cross"] = "SELL"
 
-    # 11. EMA Trend (баа EMA50дөн жогорубу)
     if ema50:
         if current_price > ema50:   checks["EMA Trend"] = "BUY"
         elif current_price < ema50: checks["EMA Trend"] = "SELL"
@@ -292,7 +286,7 @@ def analyze_pair(from_cur, to_cur):
     else:
         return None
 
-    tp, sl = calculate_tp_sl(current_price, direction, from_cur, to_cur, atr)
+    tp, sl = calculate_tp_sl(current_price, direction, pair, atr)
 
     return {
         "pair":      pair,
@@ -355,7 +349,7 @@ def send_signal(s):
         + ind_lines +
         "━━━━━━━━━━━━━━━\n"
         "⏱ Таймфрейм: " + TIMEFRAME + "\n"
-        "🌐 Alpha Vantage чыныгы баа\n"
+        "🌐 Twelve Data чыныгы баа\n"
         "⏰ " + s["time"] + "\n"
         "⚠️ _Соода тобокелчилиги өз мойнуңузда!_"
     )
@@ -368,12 +362,12 @@ def send_signal(s):
 def auto_scanner():
     while True:
         log.info("Сканерлөө башталды...")
-        for from_cur, to_cur in PAIRS:
+        for pair in PAIRS:
             try:
-                signal = analyze_pair(from_cur, to_cur)
+                signal = analyze_pair(pair)
                 if signal:
                     send_signal(signal)
-                time.sleep(15)
+                time.sleep(10)  # Rate limit үчүн
             except Exception as e:
                 log.error(str(e))
         time.sleep(CHECK_INTERVAL)
@@ -386,7 +380,7 @@ def start(message):
         "🔥 Сигнал БЕРИ " + str(MIN_CONFIRM) + "/" + str(TOTAL_INDICATORS) + " индикатор тастыктаганда!\n\n"
         "✅ RSI\n"
         "✅ MA (10/20)\n"
-        "✅ MACD\n"
+        "✅ MACD (чыныгы)\n"
         "✅ Bollinger Bands\n"
         "✅ Stochastic\n"
         "✅ ATR\n"
@@ -403,14 +397,14 @@ def start(message):
 
 @bot.message_handler(commands=["scan"])
 def manual_scan(message):
-    bot.send_message(message.chat.id, "🔍 Сканерлөө башталды... (2-3 мүнөт күт)")
+    bot.send_message(message.chat.id, "🔍 Сканерлөө башталды... (бир аз күт)")
     found = 0
-    for from_cur, to_cur in PAIRS:
-        signal = analyze_pair(from_cur, to_cur)
+    for pair in PAIRS:
+        signal = analyze_pair(pair)
         if signal:
             send_signal(signal)
             found += 1
-        time.sleep(15)
+        time.sleep(10)
     if found:
         bot.send_message(message.chat.id, "✅ " + str(found) + " сигнал табылды!")
     else:
@@ -423,14 +417,14 @@ def status(message):
         "✅ Бот иштеп жатат\n"
         "🔥 Шарт: " + str(MIN_CONFIRM) + "/" + str(TOTAL_INDICATORS) + " индикатор\n"
         "⏱ Таймфрейм: " + TIMEFRAME + "\n"
-        "🌐 API: Alpha Vantage\n"
+        "🌐 API: Twelve Data (чыныгы 15мин)\n"
         "🔄 " + str(CHECK_INTERVAL//60) + " мүнөт сайын текшерет\n"
         "💱 Жуптар: " + str(len(PAIRS))
     )
 
 @bot.message_handler(commands=["pairs"])
 def pairs_list(message):
-    text = "💱 *Жуптар:*\n" + "\n".join("• " + f + "/" + t for f, t in PAIRS)
+    text = "💱 *Жуптар:*\n" + "\n".join("• " + p for p in PAIRS)
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
 # ==================== ИШТЕТҮҮ ====================
