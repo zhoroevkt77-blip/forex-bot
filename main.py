@@ -1,4 +1,4 @@
-import telebot
+8 telebot
 import requests
 import time
 import threading
@@ -21,7 +21,7 @@ PAIRS = [
 ]
 
 CHECK_INTERVAL = 300
-MIN_CONFIRM = 6
+MIN_CONFIRM = 8
 TOTAL_INDICATORS = 11
 TIMEFRAME = "15min"
 
