@@ -8,8 +8,8 @@ from datetime import datetime
 # ==================== НАСТРОЙКА ====================
 BOT_TOKEN = "8325546419:AAG6SVUOYzL7v98NltuewOtnhtR3gbVlptg"
 ADMIN_ID = 8693522887
-TWELVE_API_KEY = "8bb0a93e7742495da70ccbd53f2bbb7c"
-
+import os
+TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY", "8bb0a93e7742495da70ccbd53f2bbb7c")
 PAIRS = [
     "EUR/USD",
     "GBP/USD",
