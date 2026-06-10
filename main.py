@@ -1,89 +1,74 @@
-import telebot
+import asyncio
+import websockets
+import json
 import requests
-import time
-import threading
 import logging
 import os
 from datetime import datetime
 
 # ==================== НАСТРОЙКА ====================
-BOT_TOKEN = "8325546419:AAG6SVUOYzL7v98NltuewOtnhtR3gbVlptg"
-ADMIN_ID = 8693522887
-TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY", "8bb0a93e7742495da70ccbd53f2bbb7c")
+DERIV_APP_ID    = "1089"                # Deriv app_id (тест үчүн 1089)
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "YOUR_DERIV_TOKEN_HERE")
+TWELVE_API_KEY  = os.environ.get("TWELVE_API_KEY", "YOUR_TWELVE_KEY_HERE")
 
-PAIRS = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "AUD/USD",
-    "USD/CAD",
-    "NZD/USD",
-]
+# Соода параметрлери
+TRADE_AMOUNT    = 1.0      # $1 — баштапкы (өзгөртүүгө болот)
+MAX_DAILY_LOSS  = 20.0     # $20 — күнүнө максималдуу жоготуу
+TIMEFRAME       = "15min"
 
-CHECK_INTERVAL = 900
-MIN_CONFIRM = 5       # 5/6 индикатор
-TOTAL_INDICATORS = 6
-TIMEFRAME = "15min"
+# Deriv synthetic индекстери (forex эмес — 24/7 иштейт)
+# Чыныгы forex Deriv'де спред контракт катары иштейт
+PAIRS_MAP = {
+    "EUR/USD": "frxEURUSD",
+    "GBP/USD": "frxGBPUSD",
+    "USD/JPY":  "frxUSDJPY",
+    "AUD/USD": "frxAUDUSD",
+    "USD/CAD": "frxUSDCAD",
+}
 
-logging.basicConfig(level=logging.INFO)
+PAIRS = list(PAIRS_MAP.keys())
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger(__name__)
-bot = telebot.TeleBot(BOT_TOKEN)
+
+# ==================== ГЛОБАЛ КүЙ ====================
+daily_loss    = 0.0
+trades_today  = 0
+active_trades = {}   # {pair: contract_id}
 
 # ==================== БААСЫН АЛУу ====================
 def get_price_data(pair):
     try:
         url = (
             "https://api.twelvedata.com/time_series"
-            "?symbol=" + pair +
-            "&interval=" + TIMEFRAME +
-            "&outputsize=220" +
-            "&apikey=" + TWELVE_API_KEY
+            "?symbol=" + pair
+            + "&interval=" + TIMEFRAME
+            + "&outputsize=220"
+            + "&apikey=" + TWELVE_API_KEY
         )
-        response = requests.get(url, timeout=15)
-        data = response.json()
-
+        r = requests.get(url, timeout=15)
+        data = r.json()
         if "values" not in data:
-            log.warning(pair + " API жооп бербеди: " + str(data))
+            log.warning(f"{pair} API жооп бербеди: {data}")
             return None
-
-        values = data["values"]
-        closes, highs, lows, opens = [], [], [], []
-        for v in reversed(values):
+        closes, highs, lows, volumes = [], [], [], []
+        for v in reversed(data["values"]):
             closes.append(float(v["close"]))
             highs.append(float(v["high"]))
             lows.append(float(v["low"]))
-            opens.append(float(v["open"]))
-
+            volumes.append(float(v.get("volume", 0)))
         if len(closes) < 50:
-            log.warning(pair + " — маалымат жетишсиз")
             return None
-
-        return closes, highs, lows, opens
-
+        return closes, highs, lows, volumes
     except Exception as e:
-        log.error("Баа алууда ката: " + str(e))
+        log.error(f"Баа алуу катасы: {e}")
         return None
 
-# ==================== 1. RSI ====================
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return None
-    deltas = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period-1) + gains[i]) / period
-        avg_loss = (avg_loss * (period-1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
-
-# ==================== 2. EMA TREND ====================
-def calculate_ema(prices, period):
+# ==================== ИНДИКАТОРЛОР ====================
+def ema(prices, period):
     if len(prices) < period:
         return None
     k = 2 / (period + 1)
@@ -92,342 +77,313 @@ def calculate_ema(prices, period):
         val = p * k + val * (1 - k)
     return round(val, 5)
 
-# ==================== 3. ORDER BLOCK ====================
-def detect_order_block(closes, highs, lows, opens, lookback=20):
-    """
-    Order Block — институционалдык зона.
-    Bullish OB: чоң ылдый свеча, андан кийин жогору кеткен
-    Bearish OB: чоң жогору свеча, андан кийин ылдый кеткен
-    """
-    if len(closes) < lookback + 3:
-        return None, None
-
-    current = closes[-1]
-    ob_bull = None
-    ob_bear = None
-
-    for i in range(-lookback, -2):
-        candle_size = abs(closes[i] - opens[i])
-        avg_size = sum(abs(closes[j] - opens[j]) for j in range(-lookback, -1)) / lookback
-
-        # Bullish Order Block
-        if (opens[i] > closes[i] and          # ылдый свеча
-            candle_size > avg_size * 1.5 and   # чоң свеча
-            closes[i+1] > opens[i+1] and       # андан кийин жогору
-            closes[i+2] > closes[i+1]):        # тренд жогору
-            ob_bull = (lows[i], highs[i])      # OB зонасы
-
-        # Bearish Order Block
-        if (closes[i] > opens[i] and           # жогору свеча
-            candle_size > avg_size * 1.5 and   # чоң свеча
-            closes[i+1] < opens[i+1] and       # андан кийин ылдый
-            closes[i+2] < closes[i+1]):        # тренд ылдый
-            ob_bear = (lows[i], highs[i])      # OB зонасы
-
-    return ob_bull, ob_bear
-
-# ==================== 4. BREAK OF STRUCTURE ====================
-def detect_bos(closes, highs, lows, lookback=20):
-    """
-    BOS — тренд өзгөрүүсү.
-    Bullish BOS: акыркы жогорку чокуну сындырды
-    Bearish BOS: акыркы төмөнкү түпкүрдү сындырды
-    """
-    if len(closes) < lookback + 1:
+def rsi(prices, period=14):
+    if len(prices) < period + 1:
         return None
+    deltas = [prices[i+1] - prices[i] for i in range(len(prices)-1)]
+    gains  = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        ag = (ag*(period-1) + gains[i]) / period
+        al = (al*(period-1) + losses[i]) / period
+    if al == 0:
+        return 100.0
+    return round(100 - (100 / (1 + ag/al)), 2)
 
-    recent_highs = highs[-lookback:-1]
-    recent_lows = lows[-lookback:-1]
-    current = closes[-1]
-
-    prev_high = max(recent_highs)
-    prev_low = min(recent_lows)
-
-    if current > prev_high:
-        return "BUY"   # Bullish BOS
-    elif current < prev_low:
-        return "SELL"  # Bearish BOS
-    return None
-
-# ==================== 5. FAIR VALUE GAP ====================
-def detect_fvg(closes, highs, lows, lookback=10):
-    """
-    FVG — баа боштугу (3 свеча арасында).
-    Bullish FVG: свеча[i] high < свеча[i+2] low
-    Bearish FVG: свеча[i] low > свеча[i+2] high
-    """
-    if len(closes) < lookback + 3:
-        return None
-
-    current = closes[-1]
-
-    for i in range(-lookback, -2):
-        # Bullish FVG
-        if highs[i] < lows[i+2]:
-            fvg_low = highs[i]
-            fvg_high = lows[i+2]
-            if fvg_low <= current <= fvg_high:
-                return "BUY"
-
-        # Bearish FVG
-        if lows[i] > highs[i+2]:
-            fvg_high = lows[i]
-            fvg_low = highs[i+2]
-            if fvg_low <= current <= fvg_high:
-                return "SELL"
-
-    return None
-
-# ==================== 6. ATR ====================
-def calculate_atr(highs, lows, closes, period=14):
+def atr(highs, lows, closes, period=14):
     if len(closes) < period + 1:
         return None
     trs = []
     for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i] - closes[i-1])
-        )
+        tr = max(highs[i]-lows[i],
+                 abs(highs[i]-closes[i-1]),
+                 abs(lows[i]-closes[i-1]))
         trs.append(tr)
     return round(sum(trs[-period:]) / period, 5)
 
-# ==================== TP/SL ====================
-def calculate_tp_sl(price, direction, pair, atr):
-    pip = 0.01 if "JPY" in pair else 0.0001
-    if atr:
-        tp_dist = atr * 3    # RR 1:3
-        sl_dist = atr * 1
+def fibonacci_levels(highs, lows, lookback=50):
+    if len(highs) < lookback:
+        return None
+    swing_high = max(highs[-lookback:])
+    swing_low  = min(lows[-lookback:])
+    diff = swing_high - swing_low
+    return {
+        "0.382": round(swing_high - diff * 0.382, 5),
+        "0.5":   round(swing_high - diff * 0.5,   5),
+        "0.618": round(swing_high - diff * 0.618, 5),
+        "swing_high": swing_high,
+        "swing_low":  swing_low,
+    }
+
+# ==================== СИГНАЛ ====================
+def get_signal(pair):
+    result = get_price_data(pair)
+    if not result:
+        return None
+
+    closes, highs, lows, volumes = result
+    price    = closes[-1]
+    ema20    = ema(closes, 20)
+    ema50    = ema(closes, 50)
+    ema200   = ema(closes, 200)
+    rsi_val  = rsi(closes)
+    fib      = fibonacci_levels(highs, lows)
+    atr_val  = atr(highs, lows, closes)
+
+    if not ema20 or not ema50 or not ema200 or rsi_val is None:
+        return None
+
+    signals = []
+
+    # --- Стратегия 1: EMA тренд + Fib pullback ---
+    if ema20 > ema50:
+        if fib and fib["0.618"] <= price <= fib["0.382"]:
+            if 40 <= rsi_val <= 60:
+                signals.append("BUY")
+    elif ema20 < ema50:
+        if fib and fib["0.382"] <= price <= fib["0.618"]:
+            if 40 <= rsi_val <= 60:
+                signals.append("SELL")
+
+    # --- Стратегия 2: EMA50+200 + RSI ---
+    if ema50 > ema200 and price > ema50 and rsi_val < 45:
+        signals.append("BUY")
+    elif ema50 < ema200 and price < ema50 and rsi_val > 55:
+        signals.append("SELL")
+
+    if signals.count("BUY") >= 2:
+        direction = "BUY"
+    elif signals.count("SELL") >= 2:
+        direction = "SELL"
     else:
-        tp_dist = 60 * pip
-        sl_dist = 20 * pip
+        return None
+
+    # TP/SL (pip боюнча)
+    pip = 0.01 if "JPY" in pair else 0.0001
+    sl_dist = (atr_val * 1.0) if atr_val else (20 * pip)
+    tp_dist = (atr_val * 3.0) if atr_val else (60 * pip)
+
     if direction == "BUY":
         tp = round(price + tp_dist, 5)
         sl = round(price - sl_dist, 5)
     else:
         tp = round(price - tp_dist, 5)
         sl = round(price + sl_dist, 5)
-    return tp, sl
 
-# ==================== СИГНАЛ АНАЛИЗИ ====================
-def analyze_pair(pair):
-    result = get_price_data(pair)
-    if not result:
-        return None
-
-    closes, highs, lows, opens = result
-    current_price = closes[-1]
-
-    # Индикаторлорду эсептөө
-    rsi      = calculate_rsi(closes)
-    ema50    = calculate_ema(closes, 50)
-    ema200   = calculate_ema(closes, 200)
-    atr      = calculate_atr(highs, lows, closes)
-    ob_bull, ob_bear = detect_order_block(closes, highs, lows, opens)
-    bos      = detect_bos(closes, highs, lows)
-    fvg      = detect_fvg(closes, highs, lows)
-
-    checks = {
-        "RSI":          None,
-        "EMA Trend":    None,
-        "Order Block":  None,
-        "BOS":          None,
-        "FVG":          None,
-        "ATR Filter":   None,
-    }
-
-    # 1. RSI
-    if rsi is not None:
-        if rsi < 45:   checks["RSI"] = "BUY"
-        elif rsi > 55: checks["RSI"] = "SELL"
-
-    # 2. EMA Trend (50/200)
-    if ema50 and ema200:
-        if ema50 > ema200 and current_price > ema50:
-            checks["EMA Trend"] = "BUY"
-        elif ema50 < ema200 and current_price < ema50:
-            checks["EMA Trend"] = "SELL"
-
-    # 3. Order Block
-    if ob_bull:
-        ob_low, ob_high = ob_bull
-        if ob_low <= current_price <= ob_high:
-            checks["Order Block"] = "BUY"
-    if ob_bear:
-        ob_low, ob_high = ob_bear
-        if ob_low <= current_price <= ob_high:
-            checks["Order Block"] = "SELL"
-
-    # 4. BOS
-    if bos:
-        checks["BOS"] = bos
-
-    # 5. FVG
-    if fvg:
-        checks["FVG"] = fvg
-
-    # 6. ATR Filter — волатилдүүлүк жетиштүүбү
-    if atr is not None:
-        pip = 0.01 if "JPY" in pair else 0.0001
-        min_atr = 5 * pip   # минимум 5 pip волатилдүүлүк
-        if atr >= min_atr:
-            # Тренд багытын аныктоо
-            if closes[-1] > closes[-5]:
-                checks["ATR Filter"] = "BUY"
-            else:
-                checks["ATR Filter"] = "SELL"
-
-    buy_count  = sum(1 for v in checks.values() if v == "BUY")
-    sell_count = sum(1 for v in checks.values() if v == "SELL")
-
-    log.info(pair + " — BUY:" + str(buy_count) + " SELL:" + str(sell_count) +
-             " RSI:" + str(rsi) + " BOS:" + str(bos) + " FVG:" + str(fvg))
-
-    if buy_count >= MIN_CONFIRM:
-        direction = "BUY"
-    elif sell_count >= MIN_CONFIRM:
-        direction = "SELL"
-    else:
-        return None
-
-    tp, sl = calculate_tp_sl(current_price, direction, pair, atr)
-    rr = round((tp - current_price) / (current_price - sl), 1) if direction == "BUY" else round((current_price - tp) / (sl - current_price), 1)
+    # Duration: 15мин таймфрейм → 15 мүнөттүк контракт
+    duration = 15
 
     return {
         "pair":      pair,
-        "price":     current_price,
+        "symbol":    PAIRS_MAP[pair],
         "direction": direction,
+        "price":     price,
         "tp":        tp,
         "sl":        sl,
-        "rr":        rr,
-        "rsi":       rsi,
+        "duration":  duration,
+        "rsi":       rsi_val,
+        "ema20":     ema20,
         "ema50":     ema50,
-        "ema200":    ema200,
-        "atr":       atr,
-        "bos":       bos,
-        "fvg":       fvg,
-        "ob_bull":   ob_bull,
-        "ob_bear":   ob_bear,
-        "checks":    checks,
-        "buy_count": buy_count,
-        "sell_count":sell_count,
-        "time":      datetime.now().strftime("%H:%M:%S")
     }
 
-# ==================== ЖӨНӨТҮҮ ====================
-def send_signal(s):
-    emoji  = "🟢" if s["direction"] == "BUY" else "🔴"
-    action = "BUY — Сатып АЛ" if s["direction"] == "BUY" else "SELL — Сат"
-    count  = s["buy_count"] if s["direction"] == "BUY" else s["sell_count"]
+# ==================== DERIV WEBSOCKET ====================
+class DerivTrader:
+    def __init__(self):
+        self.ws  = None
+        self.req_id = 1
 
-    names = {
-        "RSI":         "RSI:         `" + str(s["rsi"]) + "`",
-        "EMA Trend":   "EMA (50/200): `" + str(s["ema50"]) + "`",
-        "Order Block": "Order Block  (Smart Money)",
-        "BOS":         "Break of Structure",
-        "FVG":         "Fair Value Gap",
-        "ATR Filter":  "ATR Filter:  `" + str(s["atr"]) + "`",
-    }
+    async def connect(self):
+        url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+        self.ws = await websockets.connect(url)
+        log.info("✅ Deriv'ге туташты")
 
-    ind_lines = ""
-    for k, v in s["checks"].items():
-        mark = "✅" if v == s["direction"] else "❌"
-        ind_lines += mark + " " + names[k] + "\n"
+    async def send(self, payload):
+        payload["req_id"] = self.req_id
+        self.req_id += 1
+        await self.ws.send(json.dumps(payload))
+        resp = json.loads(await self.ws.recv())
+        return resp
 
-    msg = (
-        emoji + " *" + action + "* " + emoji + "\n"
-        "━━━━━━━━━━━━━━━\n"
-        "💱 Жуп: *" + s["pair"] + "*\n"
-        "💰 Кирүү:       `" + str(s["price"]) + "`\n"
-        "🎯 Take Profit: `" + str(s["tp"]) + "`\n"
-        "🛑 Stop Loss:   `" + str(s["sl"]) + "`\n"
-        "📊 Risk/Reward: `1:" + str(s["rr"]) + "`\n"
-        "━━━━━━━━━━━━━━━\n"
-        "🔥 *" + str(count) + "/" + str(TOTAL_INDICATORS) + " ИНДИКАТОР ТАСТЫКТАДЫ!*\n"
-        "━━━━━━━━━━━━━━━\n"
-        + ind_lines +
-        "━━━━━━━━━━━━━━━\n"
-        "⏱ Таймфрейм: " + TIMEFRAME + "\n"
-        "🌐 Twelve Data чыныгы баа\n"
-        "⏰ " + s["time"] + "\n"
-        "⚠️ _Соода тобокелчилиги өз мойнуңузда!_"
-    )
-    try:
-        bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
-    except Exception as e:
-        log.error("Жөнөтүүдө ката: " + str(e))
+    async def authorize(self):
+        resp = await self.send({"authorize": DERIV_API_TOKEN})
+        if "error" in resp:
+            log.error(f"Авторизация катасы: {resp['error']['message']}")
+            return False
+        balance = resp["authorize"]["balance"]
+        currency = resp["authorize"]["currency"]
+        log.info(f"✅ Авторизацияланды | Баланс: {balance} {currency}")
+        return True
 
-# ==================== АВТО СКАНЕР ====================
-def auto_scanner():
+    async def get_balance(self):
+        resp = await self.send({"balance": 1, "account": "current"})
+        if "balance" in resp:
+            return float(resp["balance"]["balance"])
+        return None
+
+    async def buy_contract(self, signal):
+        """Контракт сатып алуу"""
+        contract_type = "CALL" if signal["direction"] == "BUY" else "PUT"
+
+        # 1. Proposal алуу
+        proposal_resp = await self.send({
+            "proposal":       1,
+            "amount":         TRADE_AMOUNT,
+            "basis":          "stake",
+            "contract_type":  contract_type,
+            "currency":       "USD",
+            "duration":       signal["duration"],
+            "duration_unit":  "m",
+            "symbol":         signal["symbol"],
+        })
+
+        if "error" in proposal_resp:
+            log.error(f"Proposal катасы: {proposal_resp['error']['message']}")
+            return None
+
+        proposal_id = proposal_resp["proposal"]["id"]
+        ask_price   = proposal_resp["proposal"]["ask_price"]
+        log.info(f"📋 Proposal: {signal['pair']} {contract_type} | Баа: {ask_price}")
+
+        # 2. Контракт сатып алуу
+        buy_resp = await self.send({
+            "buy":   proposal_id,
+            "price": ask_price,
+        })
+
+        if "error" in buy_resp:
+            log.error(f"Buy катасы: {buy_resp['error']['message']}")
+            return None
+
+        contract_id = buy_resp["buy"]["contract_id"]
+        log.info(
+            f"✅ Контракт ачылды | {signal['pair']} {signal['direction']} | "
+            f"ID: {contract_id} | Сумма: ${TRADE_AMOUNT}"
+        )
+        return contract_id
+
+    async def sell_contract(self, contract_id):
+        """Контрактты мөөнөтүнөн мурда жабуу"""
+        resp = await self.send({"sell": contract_id, "price": 0})
+        if "error" in resp:
+            log.error(f"Sell катасы: {resp['error']['message']}")
+            return None
+        sold_for = resp["sell"].get("sold_for", 0)
+        log.info(f"📤 Контракт жабылды | ID: {contract_id} | Алынды: ${sold_for}")
+        return sold_for
+
+    async def ping(self):
+        await self.send({"ping": 1})
+
+# ==================== НЕГИЗГИ БОТ ====================
+async def run_bot():
+    global daily_loss, trades_today
+
+    trader = DerivTrader()
+
     while True:
-        log.info("Сканерлөө башталды...")
-        for pair in PAIRS:
-            try:
-                signal = analyze_pair(pair)
-                if signal:
-                    send_signal(signal)
-                time.sleep(10)
-            except Exception as e:
-                log.error(str(e))
-        time.sleep(CHECK_INTERVAL)
+        try:
+            await trader.connect()
 
-# ==================== БОТ КОМАНДЫ ====================
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.send_message(message.chat.id,
-        "📊 *Forex Smart Money Боту* 🚀\n\n"
-        "🔥 Сигнал БЕРИ " + str(MIN_CONFIRM) + "/" + str(TOTAL_INDICATORS) + " тастыктаганда!\n\n"
-        "✅ RSI (45/55)\n"
-        "✅ EMA Trend (50/200)\n"
-        "✅ Order Block (Smart Money)\n"
-        "✅ Break of Structure\n"
-        "✅ Fair Value Gap\n"
-        "✅ ATR Filter\n\n"
-        "/scan — азыр сканерлөө\n"
-        "/status — бот абалы\n"
-        "/pairs — жуптар тизмеси",
-        parse_mode="Markdown"
-    )
+            if not await trader.authorize():
+                log.error("Авторизация болгон жок. 60с күт...")
+                await asyncio.sleep(60)
+                continue
 
-@bot.message_handler(commands=["scan"])
-def manual_scan(message):
-    bot.send_message(message.chat.id, "🔍 Сканерлөө башталды... (бир аз күт)")
-    found = 0
-    for pair in PAIRS:
-        signal = analyze_pair(pair)
-        if signal:
-            send_signal(signal)
-            found += 1
-        time.sleep(10)
-    if found:
-        bot.send_message(message.chat.id, "✅ " + str(found) + " сигнал табылды!")
-    else:
-        bot.send_message(message.chat.id,
-            "❌ Азыр " + str(MIN_CONFIRM) + "/" + str(TOTAL_INDICATORS) + " тастыкталган сигнал жок")
+            log.info("🚀 Бот иштеп баштады!")
+            last_reset = datetime.now().date()
 
-@bot.message_handler(commands=["status"])
-def status(message):
-    bot.send_message(message.chat.id,
-        "✅ Бот иштеп жатат\n"
-        "🔥 Шарт: " + str(MIN_CONFIRM) + "/" + str(TOTAL_INDICATORS) + " индикатор\n"
-        "⏱ Таймфрейм: " + TIMEFRAME + "\n"
-        "🌐 API: Twelve Data\n"
-        "🔄 " + str(CHECK_INTERVAL//60) + " мүнөт сайын текшерет\n"
-        "💱 Жуптар: " + str(len(PAIRS))
-    )
+            while True:
+                # Күнүнө жоготууну баштан баштоо
+                today = datetime.now().date()
+                if today != last_reset:
+                    daily_loss   = 0.0
+                    trades_today = 0
+                    last_reset   = today
+                    log.info("🔄 Күнүнө лимит баштан башталды")
 
-@bot.message_handler(commands=["pairs"])
-def pairs_list(message):
-    text = "💱 *Жуптар:*\n" + "\n".join("• " + p for p in PAIRS)
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+                # Күнүнө жоготуу лимити
+                if daily_loss >= MAX_DAILY_LOSS:
+                    log.warning(f"🛑 Күнүнө жоготуу лимити жетти: ${daily_loss:.2f}. Бот токтоду.")
+                    await asyncio.sleep(3600)
+                    continue
+
+                # Баланс текшерүү
+                balance = await trader.get_balance()
+                if balance is not None:
+                    log.info(f"💰 Баланс: ${balance:.2f} | Соодалар: {trades_today} | Жоготуу: ${daily_loss:.2f}")
+
+                # Ар бир жуп үчүн сигнал текшерүү
+                for pair in PAIRS:
+                    if pair in active_trades:
+                        continue  # Ачык контракт бар
+
+                    signal = get_signal(pair)
+                    if not signal:
+                        log.info(f"⏳ {pair}: Сигнал жок")
+                        continue
+
+                    log.info(
+                        f"📊 СИГНАЛ: {pair} {signal['direction']} | "
+                        f"RSI: {signal['rsi']} | EMA20: {signal['ema20']}"
+                    )
+
+                    contract_id = await trader.buy_contract(signal)
+                    if contract_id:
+                        active_trades[pair] = {
+                            "contract_id": contract_id,
+                            "direction":   signal["direction"],
+                            "entry":       signal["price"],
+                            "tp":          signal["tp"],
+                            "sl":          signal["sl"],
+                            "open_time":   datetime.now(),
+                            "duration":    signal["duration"],
+                        }
+                        trades_today += 1
+
+                    await asyncio.sleep(2)
+
+                # Ачык контракттарды текшерүү (duration өткөндөн кийин)
+                closed_pairs = []
+                for pair, trade in active_trades.items():
+                    elapsed = (datetime.now() - trade["open_time"]).seconds / 60
+                    if elapsed >= trade["duration"]:
+                        sold_for = await trader.sell_contract(trade["contract_id"])
+                        if sold_for is not None:
+                            profit = sold_for - TRADE_AMOUNT
+                            if profit < 0:
+                                daily_loss += abs(profit)
+                            log.info(
+                                f"{'✅ Пайда' if profit > 0 else '❌ Жоготуу'}: "
+                                f"{pair} | ${profit:+.2f}"
+                            )
+                        closed_pairs.append(pair)
+
+                for pair in closed_pairs:
+                    del active_trades[pair]
+
+                # Ping (байланыш сактоо)
+                await trader.ping()
+
+                # 15 мүнөт күтүү
+                log.info("⏳ 15 мүнөт күтүү...")
+                await asyncio.sleep(900)
+
+        except websockets.exceptions.ConnectionClosed:
+            log.warning("🔌 Байланыш үзүлдү. 10с кийин кайра туташат...")
+            await asyncio.sleep(10)
+        except Exception as e:
+            log.error(f"Ката: {e}")
+            await asyncio.sleep(15)
 
 # ==================== ИШТЕТҮҮ ====================
 if __name__ == "__main__":
-    log.info("Forex Smart Money Боту башталды!")
-    threading.Thread(target=auto_scanner, daemon=True).start()
-    while True:
-        try:
-            bot.polling(none_stop=True, timeout=60)
-        except Exception as e:
-            log.error("Ката: " + str(e))
-            time.sleep(5)
+    log.info("=" * 50)
+    log.info("  DERIV АВТО СООДА БОТ  ")
+    log.info("=" * 50)
+    log.info(f"Сумма/соода: ${TRADE_AMOUNT}")
+    log.info(f"Күнүнө макс жоготуу: ${MAX_DAILY_LOSS}")
+    log.info(f"Жуптар: {', '.join(PAIRS)}")
+    log.info("=" * 50)
+    asyncio.run(run_bot())
