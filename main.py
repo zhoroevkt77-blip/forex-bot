@@ -6,24 +6,28 @@ import logging
 import os
 from datetime import datetime
 
-# ==================== НАСТРОЙКА ====================
-DERIV_APP_ID    = "1089"                # Deriv app_id (тест үчүн 1089)
+# ==================== КОНФИГУРАЦИЯ ====================
+DERIV_APP_ID    = os.environ.get("DERIV_APP_ID", "1089")
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "YOUR_DERIV_TOKEN_HERE")
 TWELVE_API_KEY  = os.environ.get("TWELVE_API_KEY", "YOUR_TWELVE_KEY_HERE")
 
-# Соода параметрлери
-TRADE_AMOUNT    = 1.0      # $1 — баштапкы (өзгөртүүгө болот)
-MAX_DAILY_LOSS  = 20.0     # $20 — күнүнө максималдуу жоготуу
-TIMEFRAME       = "15min"
+# MT5 конфигурациясы
+MT5_LOGIN    = os.environ.get("MT5_LOGIN", "")       # MT5 аккаунт номери
+MT5_PASSWORD = os.environ.get("MT5_PASSWORD", "")    # MT5 сырсөз
+MT5_SERVER   = os.environ.get("MT5_SERVER", "")      # MT5 сервер (мисалы: Deriv-Server)
 
-# Deriv synthetic индекстери (forex эмес — 24/7 иштейт)
-# Чыныгы forex Deriv'де спред контракт катары иштейт
+# Соода параметрлери
+TRADE_AMOUNT   = 0.01      # Lot өлчөмү (MT5 үчүн)
+MAX_DAILY_LOSS = 20.0      # $20 — күнүнө максималдуу жоготуу
+TIMEFRAME      = "15min"
+
+# MT5 символдору (Deriv MT5)
 PAIRS_MAP = {
-    "EUR/USD": "frxEURUSD",
-    "GBP/USD": "frxGBPUSD",
-    "USD/JPY":  "frxUSDJPY",
-    "AUD/USD": "frxAUDUSD",
-    "USD/CAD": "frxUSDCAD",
+    "EUR/USD": "EURUSD",
+    "GBP/USD": "GBPUSD",
+    "USD/JPY":  "USDJPY",
+    "AUD/USD": "AUDUSD",
+    "USD/CAD": "USDCAD",
 }
 
 PAIRS = list(PAIRS_MAP.keys())
@@ -37,17 +41,17 @@ log = logging.getLogger(__name__)
 # ==================== ГЛОБАЛ КүЙ ====================
 daily_loss    = 0.0
 trades_today  = 0
-active_trades = {}   # {pair: contract_id}
+active_trades = {}
 
-# ==================== БААСЫН АЛУу ====================
+# ==================== БААСЫН АЛУу (Twelve Data) ====================
 def get_price_data(pair):
     try:
         url = (
             "https://api.twelvedata.com/time_series"
-            "?symbol=" + pair
-            + "&interval=" + TIMEFRAME
-            + "&outputsize=220"
-            + "&apikey=" + TWELVE_API_KEY
+            f"?symbol={pair}"
+            f"&interval={TIMEFRAME}"
+            "&outputsize=220"
+            f"&apikey={TWELVE_API_KEY}"
         )
         r = requests.get(url, timeout=15)
         data = r.json()
@@ -117,6 +121,26 @@ def fibonacci_levels(highs, lows, lookback=50):
         "swing_low":  swing_low,
     }
 
+def macd(prices, fast=12, slow=26, signal=9):
+    if len(prices) < slow + signal:
+        return None, None
+    ema_fast = ema(prices, fast)
+    ema_slow = ema(prices, slow)
+    if ema_fast is None or ema_slow is None:
+        return None, None
+    macd_line = ema_fast - ema_slow
+    # Жөнөкөй signal line (EMA9 of MACD)
+    macd_vals = []
+    for i in range(slow, len(prices)):
+        ef = ema(prices[:i+1], fast)
+        es = ema(prices[:i+1], slow)
+        if ef and es:
+            macd_vals.append(ef - es)
+    if len(macd_vals) < signal:
+        return macd_line, None
+    signal_line = ema(macd_vals, signal)
+    return macd_line, signal_line
+
 # ==================== СИГНАЛ ====================
 def get_signal(pair):
     result = get_price_data(pair)
@@ -124,46 +148,64 @@ def get_signal(pair):
         return None
 
     closes, highs, lows, volumes = result
-    price    = closes[-1]
-    ema20    = ema(closes, 20)
-    ema50    = ema(closes, 50)
-    ema200   = ema(closes, 200)
-    rsi_val  = rsi(closes)
-    fib      = fibonacci_levels(highs, lows)
-    atr_val  = atr(highs, lows, closes)
+    price     = closes[-1]
+    ema20     = ema(closes, 20)
+    ema50     = ema(closes, 50)
+    ema200    = ema(closes, 200)
+    rsi_val   = rsi(closes)
+    fib       = fibonacci_levels(highs, lows)
+    atr_val   = atr(highs, lows, closes)
+    macd_line, signal_line = macd(closes)
 
     if not ema20 or not ema50 or not ema200 or rsi_val is None:
         return None
 
-    signals = []
+    buy_signals  = 0
+    sell_signals = 0
 
     # --- Стратегия 1: EMA тренд + Fib pullback ---
     if ema20 > ema50:
         if fib and fib["0.618"] <= price <= fib["0.382"]:
             if 40 <= rsi_val <= 60:
-                signals.append("BUY")
+                buy_signals += 1
     elif ema20 < ema50:
         if fib and fib["0.382"] <= price <= fib["0.618"]:
             if 40 <= rsi_val <= 60:
-                signals.append("SELL")
+                sell_signals += 1
 
     # --- Стратегия 2: EMA50+200 + RSI ---
     if ema50 > ema200 and price > ema50 and rsi_val < 45:
-        signals.append("BUY")
+        buy_signals += 1
     elif ema50 < ema200 and price < ema50 and rsi_val > 55:
-        signals.append("SELL")
+        sell_signals += 1
 
-    if signals.count("BUY") >= 2:
+    # --- Стратегия 3: MACD кесилиши ---
+    if macd_line and signal_line:
+        if macd_line > signal_line and macd_line < 0:
+            buy_signals += 1
+        elif macd_line < signal_line and macd_line > 0:
+            sell_signals += 1
+
+    # --- Стратегия 4: RSI ашыкча сатып алуу/сатуу ---
+    if rsi_val < 35 and price > ema200:
+        buy_signals += 1
+    elif rsi_val > 65 and price < ema200:
+        sell_signals += 1
+
+    # Жок дегенде 2 сигнал керек
+    if buy_signals >= 2:
         direction = "BUY"
-    elif signals.count("SELL") >= 2:
+        confidence = buy_signals
+    elif sell_signals >= 2:
         direction = "SELL"
+        confidence = sell_signals
     else:
         return None
 
-    # TP/SL (pip боюнча)
+    # TP/SL (ATR негизинде)
     pip = 0.01 if "JPY" in pair else 0.0001
     sl_dist = (atr_val * 1.0) if atr_val else (20 * pip)
-    tp_dist = (atr_val * 3.0) if atr_val else (60 * pip)
+    tp_dist = (atr_val * 2.5) if atr_val else (50 * pip)
 
     if direction == "BUY":
         tp = round(price + tp_dist, 5)
@@ -172,130 +214,219 @@ def get_signal(pair):
         tp = round(price - tp_dist, 5)
         sl = round(price + sl_dist, 5)
 
-    # Duration: 15мин таймфрейм → 15 мүнөттүк контракт
-    duration = 15
-
     return {
-        "pair":      pair,
-        "symbol":    PAIRS_MAP[pair],
-        "direction": direction,
-        "price":     price,
-        "tp":        tp,
-        "sl":        sl,
-        "duration":  duration,
-        "rsi":       rsi_val,
-        "ema20":     ema20,
-        "ema50":     ema50,
+        "pair":       pair,
+        "symbol":     PAIRS_MAP[pair],
+        "direction":  direction,
+        "price":      price,
+        "tp":         tp,
+        "sl":         sl,
+        "lot":        TRADE_AMOUNT,
+        "rsi":        rsi_val,
+        "ema20":      ema20,
+        "ema50":      ema50,
+        "ema200":     ema200,
+        "confidence": confidence,
     }
 
-# ==================== DERIV WEBSOCKET ====================
-class DerivTrader:
+# ==================== DERIV MT5 WEBSOCKET ====================
+class DerivMT5Bot:
     def __init__(self):
-        self.ws  = None
+        self.ws     = None
         self.req_id = 1
+        self.mt5_account_id = None
 
     async def connect(self):
         url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-        self.ws = await websockets.connect(url)
-        log.info("✅ Deriv'ге туташты")
+        self.ws = await websockets.connect(url, ping_interval=30)
+        log.info("✅ Deriv WebSocket'ке туташты")
 
     async def send(self, payload):
         payload["req_id"] = self.req_id
         self.req_id += 1
         await self.ws.send(json.dumps(payload))
         resp = json.loads(await self.ws.recv())
+        if "error" in resp:
+            log.error(f"API катасы [{resp.get('msg_type')}]: {resp['error']['message']}")
         return resp
 
     async def authorize(self):
+        """Deriv API token менен авторизациялоо"""
         resp = await self.send({"authorize": DERIV_API_TOKEN})
         if "error" in resp:
-            log.error(f"Авторизация катасы: {resp['error']['message']}")
             return False
-        balance = resp["authorize"]["balance"]
-        currency = resp["authorize"]["currency"]
-        log.info(f"✅ Авторизацияланды | Баланс: {balance} {currency}")
+        info = resp["authorize"]
+        log.info(f"✅ Авторизацияланды | Логин: {info.get('loginid')} | Баланс: {info.get('balance')} {info.get('currency')}")
         return True
 
-    async def get_balance(self):
-        resp = await self.send({"balance": 1, "account": "current"})
-        if "balance" in resp:
-            return float(resp["balance"]["balance"])
-        return None
+    async def get_mt5_accounts(self):
+        """MT5 аккаунттарын алуу"""
+        resp = await self.send({"mt5_login_list": 1})
+        if "error" in resp or "mt5_login_list" not in resp:
+            log.warning("MT5 аккаунттары табылган жок")
+            return []
+        accounts = resp["mt5_login_list"]
+        for acc in accounts:
+            log.info(
+                f"📊 MT5 Аккаунт: {acc.get('login')} | "
+                f"Тип: {acc.get('account_type')} | "
+                f"Баланс: {acc.get('balance')} {acc.get('currency')}"
+            )
+        return accounts
 
-    async def buy_contract(self, signal):
-        """Контракт сатып алуу"""
-        contract_type = "CALL" if signal["direction"] == "BUY" else "PUT"
-
-        # 1. Proposal алуу
-        proposal_resp = await self.send({
-            "proposal":       1,
-            "amount":         TRADE_AMOUNT,
-            "basis":          "stake",
-            "contract_type":  contract_type,
-            "currency":       "USD",
-            "duration":       signal["duration"],
-            "duration_unit":  "m",
-            "symbol":         signal["symbol"],
+    async def mt5_new_account(self):
+        """Жаңы MT5 аккаунт ачуу (эгер жок болсо)"""
+        resp = await self.send({
+            "mt5_new_account": 1,
+            "account_type":    "financial",
+            "mt5_account_type": "financial",
+            "leverage":        100,
+            "mainPassword":    MT5_PASSWORD or "Deriv123!",
+            "name":            "Auto Trading Bot",
+            "email":           "",
+            "country":         "kg",
         })
-
-        if "error" in proposal_resp:
-            log.error(f"Proposal катасы: {proposal_resp['error']['message']}")
-            return None
-
-        proposal_id = proposal_resp["proposal"]["id"]
-        ask_price   = proposal_resp["proposal"]["ask_price"]
-        log.info(f"📋 Proposal: {signal['pair']} {contract_type} | Баа: {ask_price}")
-
-        # 2. Контракт сатып алуу
-        buy_resp = await self.send({
-            "buy":   proposal_id,
-            "price": ask_price,
-        })
-
-        if "error" in buy_resp:
-            log.error(f"Buy катасы: {buy_resp['error']['message']}")
-            return None
-
-        contract_id = buy_resp["buy"]["contract_id"]
-        log.info(
-            f"✅ Контракт ачылды | {signal['pair']} {signal['direction']} | "
-            f"ID: {contract_id} | Сумма: ${TRADE_AMOUNT}"
-        )
-        return contract_id
-
-    async def sell_contract(self, contract_id):
-        """Контрактты мөөнөтүнөн мурда жабуу"""
-        resp = await self.send({"sell": contract_id, "price": 0})
         if "error" in resp:
-            log.error(f"Sell катасы: {resp['error']['message']}")
             return None
-        sold_for = resp["sell"].get("sold_for", 0)
-        log.info(f"📤 Контракт жабылды | ID: {contract_id} | Алынды: ${sold_for}")
-        return sold_for
+        login = resp.get("mt5_new_account", {}).get("login")
+        log.info(f"✅ Жаңы MT5 аккаунт: {login}")
+        return login
+
+    async def mt5_deposit(self, login, amount=100):
+        """MT5 аккаунтка акча которуу"""
+        resp = await self.send({
+            "mt5_deposit": 1,
+            "from_binary":  1,
+            "login":        login,
+            "amount":       amount,
+        })
+        if "error" in resp:
+            return False
+        log.info(f"✅ MT5'ке ${amount} которулду | Login: {login}")
+        return True
+
+    async def mt5_get_balance(self, login):
+        """MT5 баланс алуу"""
+        resp = await self.send({
+            "mt5_get_settings": 1,
+            "login": login,
+        })
+        if "error" in resp:
+            return None
+        settings = resp.get("mt5_get_settings", {})
+        return float(settings.get("balance", 0))
+
+    async def place_trade(self, signal, mt5_login):
+        """MT5 аркылуу соода ачуу"""
+        action = "BUY" if signal["direction"] == "BUY" else "SELL"
+
+        resp = await self.send({
+            "mt5_new_account_list": 1,
+        })
+
+        # MT5 order жиберүү
+        trade_resp = await self.send({
+            "mt5_trade": 1,
+            "login":        mt5_login,
+            "symbol":       signal["symbol"],
+            "volume":       signal["lot"],
+            "type":         action,
+            "price":        signal["price"],
+            "tp":           signal["tp"],
+            "sl":           signal["sl"],
+            "comment":      f"AutoBot|{signal['pair']}|RSI{signal['rsi']}",
+        })
+
+        if "error" in trade_resp:
+            log.error(f"Соода ачуу катасы: {trade_resp['error']['message']}")
+            return None
+
+        order_id = trade_resp.get("mt5_trade", {}).get("order")
+        if order_id:
+            log.info(
+                f"✅ MT5 ОРДЕР: {signal['pair']} {action} | "
+                f"Лот: {signal['lot']} | "
+                f"Баа: {signal['price']} | "
+                f"TP: {signal['tp']} | SL: {signal['sl']} | "
+                f"Order ID: {order_id}"
+            )
+        return order_id
+
+    async def close_trade(self, mt5_login, order_id, symbol, direction, volume):
+        """MT5 ордерди жабуу"""
+        close_action = "SELL" if direction == "BUY" else "BUY"
+
+        resp = await self.send({
+            "mt5_trade": 1,
+            "login":   mt5_login,
+            "symbol":  symbol,
+            "volume":  volume,
+            "type":    close_action,
+            "comment": f"Close|{order_id}",
+        })
+
+        if "error" in resp:
+            log.error(f"Жабуу катасы: {resp['error']['message']}")
+            return False
+
+        log.info(f"📤 MT5 ордер жабылды | Order: {order_id}")
+        return True
+
+    async def get_open_positions(self, mt5_login):
+        """Ачык позицияларды алуу"""
+        resp = await self.send({
+            "mt5_get_settings": 1,
+            "login": mt5_login,
+        })
+        return resp
 
     async def ping(self):
-        await self.send({"ping": 1})
+        try:
+            await self.send({"ping": 1})
+        except Exception:
+            pass
 
 # ==================== НЕГИЗГИ БОТ ====================
 async def run_bot():
     global daily_loss, trades_today
 
-    trader = DerivTrader()
+    bot = DerivMT5Bot()
 
     while True:
         try:
-            await trader.connect()
+            await bot.connect()
 
-            if not await trader.authorize():
+            if not await bot.authorize():
                 log.error("Авторизация болгон жок. 60с күт...")
                 await asyncio.sleep(60)
                 continue
 
-            log.info("🚀 Бот иштеп баштады!")
+            # MT5 аккаунттарын алуу
+            mt5_accounts = await bot.get_mt5_accounts()
+
+            if not mt5_accounts:
+                log.warning("MT5 аккаунт жок. Жаңысын ачып жатабыз...")
+                mt5_login = await bot.mt5_new_account()
+                if not mt5_login:
+                    log.error("MT5 аккаунт ачуу мүмкүн болгон жок")
+                    await asyncio.sleep(60)
+                    continue
+            else:
+                # Биринчи demo же financial аккаунтту алуу
+                mt5_login = None
+                for acc in mt5_accounts:
+                    if acc.get("account_type") in ["demo", "financial"]:
+                        mt5_login = acc["login"]
+                        log.info(f"🎯 Колдонулуп жаткан MT5: {mt5_login} ({acc.get('account_type')})")
+                        break
+                if not mt5_login:
+                    mt5_login = mt5_accounts[0]["login"]
+
+            log.info(f"🚀 MT5 Бот иштеп баштады! Login: {mt5_login}")
             last_reset = datetime.now().date()
 
             while True:
-                # Күнүнө жоготууну баштан баштоо
+                # Күнүнө лимит баштан башталышы
                 today = datetime.now().date()
                 if today != last_reset:
                     daily_loss   = 0.0
@@ -303,21 +434,38 @@ async def run_bot():
                     last_reset   = today
                     log.info("🔄 Күнүнө лимит баштан башталды")
 
-                # Күнүнө жоготуу лимити
+                # Жоготуу лимити
                 if daily_loss >= MAX_DAILY_LOSS:
-                    log.warning(f"🛑 Күнүнө жоготуу лимити жетти: ${daily_loss:.2f}. Бот токтоду.")
+                    log.warning(f"🛑 Күнүнө жоготуу лимити: ${daily_loss:.2f}. Токтоду.")
                     await asyncio.sleep(3600)
                     continue
 
-                # Баланс текшерүү
-                balance = await trader.get_balance()
+                # MT5 баланс
+                balance = await bot.mt5_get_balance(mt5_login)
                 if balance is not None:
-                    log.info(f"💰 Баланс: ${balance:.2f} | Соодалар: {trades_today} | Жоготуу: ${daily_loss:.2f}")
+                    log.info(
+                        f"💰 MT5 Баланс: ${balance:.2f} | "
+                        f"Соодалар: {trades_today} | "
+                        f"Жоготуу: ${daily_loss:.2f}"
+                    )
 
                 # Ар бир жуп үчүн сигнал текшерүү
                 for pair in PAIRS:
                     if pair in active_trades:
-                        continue  # Ачык контракт бар
+                        # Ачык соода бар — убакытты текшер
+                        trade = active_trades[pair]
+                        elapsed = (datetime.now() - trade["open_time"]).seconds / 60
+                        if elapsed >= 60:  # 1 саат өткөндөн кийин жабуу
+                            success = await bot.close_trade(
+                                mt5_login,
+                                trade["order_id"],
+                                PAIRS_MAP[pair],
+                                trade["direction"],
+                                TRADE_AMOUNT,
+                            )
+                            if success:
+                                del active_trades[pair]
+                        continue
 
                     signal = get_signal(pair)
                     if not signal:
@@ -326,64 +474,56 @@ async def run_bot():
 
                     log.info(
                         f"📊 СИГНАЛ: {pair} {signal['direction']} | "
-                        f"RSI: {signal['rsi']} | EMA20: {signal['ema20']}"
+                        f"Ишеним: {signal['confidence']}/4 | "
+                        f"RSI: {signal['rsi']} | "
+                        f"Баа: {signal['price']}"
                     )
 
-                    contract_id = await trader.buy_contract(signal)
-                    if contract_id:
+                    order_id = await bot.place_trade(signal, mt5_login)
+                    if order_id:
                         active_trades[pair] = {
-                            "contract_id": contract_id,
-                            "direction":   signal["direction"],
-                            "entry":       signal["price"],
-                            "tp":          signal["tp"],
-                            "sl":          signal["sl"],
-                            "open_time":   datetime.now(),
-                            "duration":    signal["duration"],
+                            "order_id":  order_id,
+                            "direction": signal["direction"],
+                            "entry":     signal["price"],
+                            "tp":        signal["tp"],
+                            "sl":        signal["sl"],
+                            "open_time": datetime.now(),
                         }
                         trades_today += 1
 
                     await asyncio.sleep(2)
 
-                # Ачык контракттарды текшерүү (duration өткөндөн кийин)
-                closed_pairs = []
-                for pair, trade in active_trades.items():
-                    elapsed = (datetime.now() - trade["open_time"]).seconds / 60
-                    if elapsed >= trade["duration"]:
-                        sold_for = await trader.sell_contract(trade["contract_id"])
-                        if sold_for is not None:
-                            profit = sold_for - TRADE_AMOUNT
-                            if profit < 0:
-                                daily_loss += abs(profit)
-                            log.info(
-                                f"{'✅ Пайда' if profit > 0 else '❌ Жоготуу'}: "
-                                f"{pair} | ${profit:+.2f}"
-                            )
-                        closed_pairs.append(pair)
+                # Ping — байланыш сактоо
+                await bot.ping()
 
-                for pair in closed_pairs:
-                    del active_trades[pair]
-
-                # Ping (байланыш сактоо)
-                await trader.ping()
-
-                # 15 мүнөт күтүү
                 log.info("⏳ 15 мүнөт күтүү...")
                 await asyncio.sleep(900)
 
         except websockets.exceptions.ConnectionClosed:
             log.warning("🔌 Байланыш үзүлдү. 10с кийин кайра туташат...")
             await asyncio.sleep(10)
+        except KeyboardInterrupt:
+            log.info("🛑 Бот токтотулду")
+            break
         except Exception as e:
-            log.error(f"Ката: {e}")
+            log.error(f"Ката: {e}", exc_info=True)
             await asyncio.sleep(15)
 
 # ==================== ИШТЕТҮҮ ====================
 if __name__ == "__main__":
-    log.info("=" * 50)
-    log.info("  DERIV АВТО СООДА БОТ  ")
-    log.info("=" * 50)
-    log.info(f"Сумма/соода: ${TRADE_AMOUNT}")
+    log.info("=" * 55)
+    log.info("   DERIV MT5 АВТО СООДА БОТ   ")
+    log.info("=" * 55)
+    log.info(f"Лот өлчөмү:        {TRADE_AMOUNT}")
     log.info(f"Күнүнө макс жоготуу: ${MAX_DAILY_LOSS}")
-    log.info(f"Жуптар: {', '.join(PAIRS)}")
-    log.info("=" * 50)
+    log.info(f"Жуптар:            {', '.join(PAIRS)}")
+    log.info(f"Таймфрейм:         {TIMEFRAME}")
+    log.info("=" * 55)
+
+    # Айлана-чөйрө өзгөрмөлөрүн текшерүү
+    if DERIV_API_TOKEN == "YOUR_DERIV_TOKEN_HERE":
+        log.warning("⚠️  DERIV_API_TOKEN коюлган жок!")
+    if TWELVE_API_KEY == "YOUR_TWELVE_KEY_HERE":
+        log.warning("⚠️  TWELVE_API_KEY коюлган жок!")
+
     asyncio.run(run_bot())
