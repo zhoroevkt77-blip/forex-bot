@@ -8,7 +8,7 @@ from datetime import datetime
 
 # ==================== КОНФИГУРАЦИЯ ====================
 DERIV_APP_ID    = os.environ.get("DERIV_APP_ID", "1089")
-DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "YOUR_DERIV_TOKEN_HERE")
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "pat_a8ed6a3d58be5b4d856d6e467965534d34e0a4c3d8dd3860fca899a6efcc830a")
 TWELVE_API_KEY  = os.environ.get("TWELVE_API_KEY", "YOUR_TWELVE_KEY_HERE")
 
 # MT5 конфигурациясы
